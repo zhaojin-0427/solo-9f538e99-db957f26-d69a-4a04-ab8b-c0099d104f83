@@ -4,7 +4,7 @@ import threading
 
 from flask import Flask, jsonify, render_template, request
 
-from . import config, source, target
+from . import config, source, target, undo
 from .syncer import FaultInjector, Syncer
 
 log = logging.getLogger("geosync.web")
@@ -153,5 +153,58 @@ def create_app() -> Flask:
     @app.get("/api/target/samples")
     def target_samples():
         return jsonify({"samples": target.list_samples(config.TARGET_DB)})
+
+    # ------------------------------------------------------------- 更正撤销
+    def _parse_tx_id():
+        raw = (request.args.get("tx_id") or "").strip()
+        try:
+            tx_id = int(raw)
+        except (TypeError, ValueError):
+            return None, (jsonify({"ok": False,
+                                   "message": "tx_id 必须是整数源事务号"}), 400)
+        if tx_id <= 0:
+            return None, (jsonify({"ok": False,
+                                   "message": "tx_id 必须是正整数"}), 400)
+        return tx_id, None
+
+    @app.get("/api/undo/preview")
+    def undo_preview():
+        """按源事务号查看提交前后值、可撤销性与冲突（只读，不修改任何数据）。"""
+        tx_id, err = _parse_tx_id()
+        if err is not None:
+            return err
+        try:
+            info = undo.preview_undo(config.SOURCE_DB, tx_id)
+        except undo.UndoNotFound as exc:
+            return jsonify({"ok": False, "message": str(exc)}), 404
+        except undo.UndoNotSupported as exc:
+            return jsonify({"ok": False, "undoable": False,
+                            "reason": str(exc), "message": str(exc)}), 409
+        return jsonify({"ok": True, **info})
+
+    @app.post("/api/undo/confirm")
+    def undo_confirm():
+        """确认撤销：原子提交补偿事务；重复撤销返回同一补偿事务。"""
+        body = request.get_json(silent=True) or {}
+        try:
+            tx_id = int(body.get("tx_id"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False,
+                            "message": "body 需包含整数 tx_id"}), 400
+        if tx_id <= 0:
+            return jsonify({"ok": False,
+                            "message": "tx_id 必须是正整数"}), 400
+        try:
+            result = undo.confirm_undo(config.SOURCE_DB, tx_id)
+        except undo.UndoNotFound as exc:
+            return jsonify({"ok": False, "message": str(exc)}), 404
+        except undo.UndoNotSupported as exc:
+            return jsonify({"ok": False, "message": str(exc)}), 409
+        except undo.UndoConflict as exc:
+            # 冲突时回传明细，便于前端逐项列明。
+            info = undo.preview_undo(config.SOURCE_DB, tx_id)
+            return jsonify({"ok": False, "message": str(exc),
+                            "conflicts": info.get("conflicts", [])}), 409
+        return jsonify({"ok": True, **result})
 
     return app

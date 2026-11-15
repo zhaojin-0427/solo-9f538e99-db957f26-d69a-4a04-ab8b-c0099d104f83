@@ -23,6 +23,9 @@
   .b-ready{ background:var(--ok); color:#052e12; }
   .b-ok   { background:#14532d; color:#86efac; }
   .b-bad  { background:#7f1d1d; color:#fecaca; }
+  .b-comp { background:#7c2d12; color:#fed7aa; }
+  .b-done { background:#1e3a8a; color:#bfdbfe; }
+  .b-lock { background:#3f3f46; color:#d4d4d8; }
   button { background:var(--acc); color:#082f49; border:0; border-radius:8px; padding:8px 14px;
            font-weight:600; cursor:pointer; margin:4px 6px 4px 0; }
   button:disabled { background:#475569; color:#94a3b8; cursor:not-allowed; }
@@ -96,10 +99,27 @@
     <div id="qResult"></div>
   </section>
 
-  <section class="card">
+  <section class="card" style="grid-column:1/-1">
+    <h2>更正撤销（作业库）</h2>
+    <div class="row">
+      <input id="undoTx" type="number" min="1" placeholder="源事务号 tx_id，如 5">
+      <button id="btnUndoPreview">查看前后值</button>
+      <button id="btnUndoConfirm" class="danger" disabled>确认撤销该笔更正</button>
+      <span id="undoMsg" class="mut"></span>
+    </div>
+    <p class="mut" style="margin:8px 0 0">
+      仅支持撤销功能启用后、带前后值记录的普通更正；补偿事务不可撤销。
+      撤销以一笔<b>新的补偿事务</b>恢复各受影响项的原值或原缺失状态，
+      其他后来的修改保留，经原增量链路进入分析库，水位不回退。
+      任一受影响项后来被改过（含改回原值、删后重建）即整笔拒绝并列明冲突。
+    </p>
+    <div id="undoResult"></div>
+  </section>
+
+  <section class="card" style="grid-column:1/-1">
     <h2>作业库 · 最近事务日志</h2>
     <div class="scroll"><table>
-      <thead><tr><th>tx</th><th>时间</th><th>说明</th><th>操作流水</th></tr></thead>
+      <thead><tr><th>tx</th><th>时间</th><th>类型</th><th>说明</th><th>操作流水</th><th>撤销状态</th></tr></thead>
       <tbody id="txLog"></tbody>
     </table></div>
   </section>
@@ -154,8 +174,22 @@ async function refresh(){
                   : `${o.sample_no}/${o.item}${o.op==='upsert'?'='+o.value:''}`;
       return `${sym}${what}`;
     }).join('；');
-    return `<tr><td>${t.tx_id}</td><td class="mut">${t.created_at}</td><td>${t.note}</td><td>${ops}</td></tr>`;
-  }).join('') || '<tr><td colspan="4" class="mut">暂无事务</td></tr>';
+    let typeBadge, undoBadge;
+    if (t.is_compensation) {
+      typeBadge = '<span class="badge b-comp">补偿事务</span>';
+      undoBadge = '<span class="badge b-lock">不可撤销</span>';
+    } else {
+      typeBadge = '<span class="badge b-idle">普通更正</span>';
+      if (t.undone_by_tx) {
+        undoBadge = `<span class="badge b-done">已撤销 → tx=${t.undone_by_tx}</span>`;
+      } else if (t.undoable_recorded) {
+        undoBadge = `<button class="ghost" style="padding:2px 8px" onclick="loadUndoPreview(${t.tx_id})">可撤销</button>`;
+      } else {
+        undoBadge = '<span class="badge b-lock">旧事务·不可撤销</span>';
+      }
+    }
+    return `<tr><td>${t.tx_id}</td><td class="mut">${t.created_at}</td><td>${typeBadge}</td><td>${t.note}</td><td>${ops}</td><td>${undoBadge}</td></tr>`;
+  }).join('') || '<tr><td colspan="6" class="mut">暂无事务</td></tr>';
 
   if (s.phase === 'ready'){
     const ts = await api('/api/target/samples');
@@ -198,6 +232,85 @@ $('btnQuery').onclick = async ()=>{
 };
 refresh();
 setInterval(refresh, 1000);
+
+// --------------------------------------------------------------- 更正撤销
+function fmtVal(v, missing){
+  if (missing) return '<span class="mut">（缺失）</span>';
+  return `<b>${v}</b>`;
+}
+async function loadUndoPreview(txId){
+  if (txId === undefined || txId === null) {
+    txId = parseInt($('undoTx').value, 10);
+  } else {
+    $('undoTx').value = txId;
+  }
+  if (!txId || txId <= 0){ toast('请输入有效的源事务号', true); return; }
+  const r = await api('/api/undo/preview?tx_id=' + encodeURIComponent(txId));
+  const msg = $('undoMsg'), box = $('undoResult');
+  $('btnUndoConfirm').disabled = true;
+  if (!r.ok){
+    msg.textContent = r.message || '查询失败';
+    msg.className = 'err';
+    box.innerHTML = '';
+    return;
+  }
+  msg.className = 'mut';
+  if (r.already_undone){
+    msg.textContent = `该事务已撤销，补偿事务 tx=${r.compensation_tx_id}（重复撤销返回同一补偿事务）`;
+    box.innerHTML = '';
+    return;
+  }
+  if (!r.undoable && (!r.changes || r.changes.length === 0)){
+    msg.textContent = r.reason || '该事务不可撤销';
+    msg.className = 'err';
+    box.innerHTML = '';
+    return;
+  }
+  const rows = r.changes.map(c=>{
+    const name = c.entity === 'sample'
+      ? `采样点（${c.sample_no}）`
+      : `检测项目 ${c.sample_no}/${c.item}`;
+    return `<tr><td>${name}</td><td>${fmtVal(c.before, c.before_missing)}</td>
+            <td>${fmtVal(c.after, c.after_missing)}</td></tr>`;
+  }).join('');
+  let conflictHtml = '';
+  if (r.conflicts && r.conflicts.length){
+    conflictHtml = `<p class="err">冲突明细（整笔拒绝，共 ${r.conflicts.length} 项）：</p>
+      <table><thead><tr><th>受影响项</th><th>后续修改事务</th></tr></thead><tbody>
+      ${r.conflicts.map(c=>`<tr><td>${c.entity==='sample'?'采样点 '+c.sample_no:c.sample_no+'/'+c.item}</td>
+        <td class="err">tx=${c.later_tx_id}</td></tr>`).join('')}
+      </tbody></table>`;
+    msg.textContent = r.reason || '存在冲突，不可撤销';
+    msg.className = 'err';
+  } else {
+    msg.textContent = '无冲突，可以撤销（确认时会重新判断）';
+    msg.className = 'ok';
+    $('btnUndoConfirm').disabled = false;
+  }
+  box.innerHTML =
+    `<p class="mut" style="margin:10px 0 4px">事务 tx=${r.tx_id} 各受影响项提交前后实际变化（撤销将把"当前值"恢复为"撤销前值"列）：</p>
+     <table><thead><tr><th>受影响项</th><th>撤销前值（更正前）</th><th>更正后值</th></tr></thead>
+     <tbody>${rows}</tbody></table>${conflictHtml}`;
+}
+$('btnUndoPreview').onclick = ()=>loadUndoPreview();
+$('btnUndoConfirm').onclick = async ()=>{
+  const txId = parseInt($('undoTx').value, 10);
+  if (!txId){ toast('请输入有效的源事务号', true); return; }
+  const r = await api('/api/undo/confirm', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({tx_id:txId})});
+  if (!r.ok){
+    toast(r.message || '撤销被拒绝', true);
+    loadUndoPreview(txId);  // 刷新冲突明细
+    refresh();
+    return;
+  }
+  toast(r.idempotent
+    ? `重复撤销：返回同一补偿事务 tx=${r.compensation_tx_id}`
+    : `撤销成功：补偿事务 tx=${r.compensation_tx_id} 已提交，将经增量链路同步`);
+  $('btnUndoConfirm').disabled = true;
+  loadUndoPreview(txId);
+  refresh();
+};
 </script>
 </body>
 </html>

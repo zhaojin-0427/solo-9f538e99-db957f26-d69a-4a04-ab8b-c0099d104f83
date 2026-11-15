@@ -8,10 +8,20 @@
   tx_log(tx_id, note, created_at)     一行 = 源端一笔已提交事务
   tx_ops(tx_id, seq, entity, op, ...) 该事务内的有序操作流水
 
+撤销功能（更正撤销/补偿）相关表：
+  undo_change  每笔"普通更正"提交时，在同一事务内按【采样点 + 各检测项目】
+               为单位记录每个受影响项的提交前后实际值（增/删/改都体现为
+               before/after 的缺失或存在），是判断可撤销性与冲突的依据；
+               旧事务（功能启用前）没有对应行 -> 标明不可撤销。
+  undo_record  撤销登记：原事务 -> 补偿事务。撤销记录、业务数据与
+               tx_log/tx_ops/undo_change 补偿日志在同一事务提交，
+               失败整体回滚；重复撤销按原事务号返回同一补偿事务。
+
 tx_id 使用普通 INTEGER PRIMARY KEY（rowid 别名，非 AUTOINCREMENT）：
 SQLite 单写者串行提交，rowid 顺序即源端提交顺序；回滚事务不占用号段，
 因此已提交的 tx_id 连续无空洞，增量端可按 tx_id 严格依序追赶。
 """
+import json
 import logging
 import random
 import threading
@@ -50,12 +60,30 @@ CREATE TABLE IF NOT EXISTS tx_ops (
   value     REAL,
   PRIMARY KEY (tx_id, seq)
 );
+-- 撤销功能：逐"受影响项"记录更正提交前后的实际状态（与更正同事务写入）。
+CREATE TABLE IF NOT EXISTS undo_change (
+  tx_id        INTEGER NOT NULL REFERENCES tx_log(tx_id),
+  entity       TEXT NOT NULL,       -- 'sample'（采样点）| 'result'（检测项目）
+  sample_no    TEXT NOT NULL,
+  item         TEXT,                -- result 时为项目名；sample 时为 NULL
+  before_state TEXT,                -- JSON 标量；NULL 表示提交前缺失（新增项）
+  after_state  TEXT,                -- JSON 标量；NULL 表示提交后缺失（删除项）
+  PRIMARY KEY (tx_id, entity, sample_no, item)
+);
+-- 撤销登记：一笔原更正至多对应一笔补偿事务（UNIQUE 保证重复撤销幂等）。
+CREATE TABLE IF NOT EXISTS undo_record (
+  original_tx_id   INTEGER PRIMARY KEY REFERENCES tx_log(tx_id),
+  compensation_tx_id INTEGER NOT NULL UNIQUE REFERENCES tx_log(tx_id),
+  created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE INDEX IF NOT EXISTS idx_results_sample ON results(sample_no);
+CREATE INDEX IF NOT EXISTS idx_undo_change_tx ON undo_change(tx_id);
+CREATE INDEX IF NOT EXISTS idx_undo_record_comp ON undo_record(compensation_tx_id);
 """
 
 ITEMS = ["Au", "Ag", "Cu", "Pb", "Zn", "Fe"]
 
-# 进程内写锁：串行化演示端发起的更正事务（SQLite 本身亦单写者，双保险）。
+# 进程内写锁：串行化演示端发起的更正/撤销事务（SQLite 本身亦单写者，双保险）。
 _write_lock = threading.Lock()
 
 
@@ -93,12 +121,111 @@ def seed_if_empty(path: str, n_samples: int = 20, rng: random.Random | None = No
     return n_samples
 
 
-def _apply_correction_txn(conn, sample_no: str, new_site: str | None,
-                          adds: list[dict], dels: list[str], note: str) -> int:
-    """在 conn 上执行一笔完整更正事务：改样品 + 增删多条结果 + 写变更日志。
+# ---------------------------------------------------------------------- #
+# 撤销支撑：状态快照、差异计算与日志写入
+# ---------------------------------------------------------------------- #
+def _state(value):
+    """把单个业务值编码为可空 JSON 文本；None 表示该项缺失。"""
+    return None if value is None else json.dumps(value, ensure_ascii=False)
 
-    全部操作处于同一事务：要么整体提交，要么整体回滚，
-    分析库随后按日志整笔重放，两端语义一致。
+
+def _snapshot_keys(conn, sample_no: str, keys: set[tuple]) -> dict[tuple, str]:
+    """在当前事务内读取一批 (entity, sample_no, item) 的提交前状态。
+
+    采样点状态为其 site 文本；检测项目状态为其 value（REAL）；
+    不存在的行返回 None（缺失），因此"新增/删除"与"改值"一样可被精确识别。
+    """
+    out: dict[tuple, str] = {}
+    sample_keys = {k for k in keys if k[0] == "sample"}
+    result_keys = {k for k in keys if k[0] == "result"}
+    if sample_keys:
+        row = conn.execute(
+            "SELECT site FROM samples WHERE sample_no=?", (sample_no,)
+        ).fetchone()
+        site = row["site"] if row is not None else None
+        for k in sample_keys:
+            out[k] = _state(site)
+    for _entity, sno, item in result_keys:
+        row = conn.execute(
+            "SELECT value FROM results WHERE sample_no=? AND item=?", (sno, item)
+        ).fetchone()
+        out[("result", sno, item)] = _state(row["value"] if row is not None else None)
+    return out
+
+
+def _current_keys(conn, sample_no: str, keys: set[tuple]) -> dict[tuple, str]:
+    """业务写入之后读取同一批键的提交后状态（结构与 _snapshot_keys 相同）。"""
+    return _snapshot_keys(conn, sample_no, keys)
+
+
+def _insert_undo_changes(conn, tx_id: int, changes: list[dict]) -> None:
+    """把一笔更正识别出的前后实际变化写入 undo_change（同事务）。"""
+    conn.executemany(
+        "INSERT INTO undo_change(tx_id, entity, sample_no, item, before_state, "
+        "after_state) VALUES(?,?,?,?,?,?)",
+        [(tx_id, c["entity"], c["sample_no"], c.get("item"),
+          c["before_state"], c["after_state"]) for c in changes],
+    )
+
+
+def _apply_business_writes(conn, sample_no: str, new_site: str | None,
+                           adds: list[dict], dels: list[str]) -> None:
+    """更正事务的业务写入部分（调用方已持有打开的事务与写锁）。"""
+    if new_site is not None:
+        conn.execute(
+            "UPDATE samples SET site=?, updated_at=datetime('now') WHERE sample_no=?",
+            (new_site, sample_no),
+        )
+    for item in dels:
+        conn.execute(
+            "DELETE FROM results WHERE sample_no=? AND item=?", (sample_no, item)
+        )
+    for a in adds:
+        conn.execute(
+            "INSERT OR REPLACE INTO results(sample_no, item, value) VALUES(?,?,?)",
+            (sample_no, a["item"], float(a["value"])),
+        )
+
+
+def _write_tx_log(conn, sample_no: str, new_site: str | None,
+                  adds: list[dict], dels: list[str], note: str) -> int:
+    """写 tx_log + 有序 tx_ops，返回新事务号（调用方持有打开的事务）。"""
+    tx_id = conn.execute("INSERT INTO tx_log(note) VALUES(?)", (note,)).lastrowid
+    seq = 0
+    insert_op = (
+        "INSERT INTO tx_ops(tx_id, seq, entity, op, sample_no, item, site, value)"
+        " VALUES(?,?,?,?,?,?,?,?)"
+    )
+    # 与历史行为保持一致：每笔事务都写一条 sample upsert 日志（即便站点
+    # 未变），目标端重放为幂等 upsert，不影响结果。
+    conn.execute(
+        insert_op,
+        (tx_id, seq, "sample", "upsert", sample_no, None, new_site, None),
+    )
+    for item in dels:
+        seq += 1
+        conn.execute(
+            insert_op,
+            (tx_id, seq, "result", "delete", sample_no, item, None, None),
+        )
+    for a in adds:
+        seq += 1
+        conn.execute(
+            insert_op,
+            (tx_id, seq, "result", "upsert", sample_no, a["item"], None,
+             float(a["value"])),
+        )
+    return tx_id
+
+
+def _correction_txn_locked(conn, sample_no: str, new_site: str | None,
+                           adds: list[dict], dels: list[str], note: str,
+                           record_changes: bool = True) -> int:
+    """在调用方持有的连接上执行一笔完整更正事务。
+
+    全部操作处于同一 SQLite 事务：业务写入、tx_log/tx_ops 变更日志、
+    undo_change 前后值快照要么整体提交，要么整体回滚。
+    分析库随后按 tx_ops 整笔重放，两端语义一致。
     """
     cur = conn.execute(
         "SELECT sample_no, site FROM samples WHERE sample_no=?", (sample_no,)
@@ -108,44 +235,29 @@ def _apply_correction_txn(conn, sample_no: str, new_site: str | None,
     if new_site is None:
         new_site = cur["site"]
 
+    # 受影响项键集合：采样点 + 每个被增/删的检测项目（改值走 adds 的 upsert）。
+    keys: set[tuple] = set()
+    if new_site != cur["site"]:
+        keys.add(("sample", sample_no, None))
+    for item in dels:
+        keys.add(("result", sample_no, item))
+    for a in adds:
+        keys.add(("result", sample_no, a["item"]))
+
     conn.execute("BEGIN IMMEDIATE")
     try:
-        conn.execute(
-            "UPDATE samples SET site=?, updated_at=datetime('now') WHERE sample_no=?",
-            (new_site, sample_no),
-        )
-        for item in dels:
-            conn.execute(
-                "DELETE FROM results WHERE sample_no=? AND item=?", (sample_no, item)
-            )
-        for a in adds:
-            conn.execute(
-                "INSERT OR REPLACE INTO results(sample_no, item, value) VALUES(?,?,?)",
-                (sample_no, a["item"], float(a["value"])),
-            )
-        tx_id = conn.execute("INSERT INTO tx_log(note) VALUES(?)", (note,)).lastrowid
-        seq = 0
-        insert_op = (
-            "INSERT INTO tx_ops(tx_id, seq, entity, op, sample_no, item, site, value)"
-            " VALUES(?,?,?,?,?,?,?,?)"
-        )
-        conn.execute(
-            insert_op,
-            (tx_id, seq, "sample", "upsert", sample_no, None, new_site, None),
-        )
-        for item in dels:
-            seq += 1
-            conn.execute(
-                insert_op,
-                (tx_id, seq, "result", "delete", sample_no, item, None, None),
-            )
-        for a in adds:
-            seq += 1
-            conn.execute(
-                insert_op,
-                (tx_id, seq, "result", "upsert", sample_no, a["item"], None,
-                 float(a["value"])),
-            )
+        # 提交前快照必须在同一事务、业务写入之前读取。
+        before = _snapshot_keys(conn, sample_no, keys) if record_changes else {}
+        _apply_business_writes(conn, sample_no, new_site, adds, dels)
+        tx_id = _write_tx_log(conn, sample_no, new_site, adds, dels, note)
+        if record_changes:
+            after = _current_keys(conn, sample_no, keys)
+            changes = [
+                {"entity": k[0], "sample_no": k[1], "item": k[2],
+                 "before_state": before[k], "after_state": after[k]}
+                for k in keys
+            ]
+            _insert_undo_changes(conn, tx_id, changes)
         conn.execute("COMMIT")
         return tx_id
     except Exception:
@@ -162,7 +274,9 @@ def apply_correction(path: str, sample_no: str, new_site: str | None = None,
     if not adds and not dels and new_site is None:
         raise ValueError("更正内容为空")
     with _write_lock, closing(connect(path)) as conn:
-        tx_id = _apply_correction_txn(conn, sample_no, new_site, adds, dels, note)
+        tx_id = _correction_txn_locked(
+            conn, sample_no, new_site, adds, dels, note, record_changes=True
+        )
     log.info("源端更正已提交 tx=%d 样品=%s (+%d/-%d 条结果)", tx_id, sample_no,
              len(adds), len(dels))
     return tx_id
@@ -199,7 +313,9 @@ def random_correction(path: str, rng: random.Random | None = None,
                          "value": round(rng.uniform(0.01, 50.0), 3)})
         new_site = f"{site.split('-R')[0]}-R{rng.randint(1, 999)}"
 
-        tx_id = _apply_correction_txn(conn, sample_no, new_site, adds, dels, note)
+        tx_id = _correction_txn_locked(
+            conn, sample_no, new_site, adds, dels, note, record_changes=True
+        )
     log.info("源端更正已提交 tx=%d 样品=%s (+%d/-%d 条结果)", tx_id, sample_no,
              len(adds), len(dels))
     return {"tx_id": tx_id, "sample_no": sample_no, "new_site": new_site,
@@ -260,6 +376,7 @@ def max_tx(path: str) -> int:
 
 
 def recent_txs(path: str, limit: int = 20) -> list[dict]:
+    """最近事务日志，并附带撤销视角的标记（补偿/已撤销/可撤销）。"""
     with closing(connect(path)) as conn:
         txs = [dict(r) for r in conn.execute(
             "SELECT tx_id, note, created_at FROM tx_log "
@@ -272,11 +389,30 @@ def recent_txs(path: str, limit: int = 20) -> list[dict]:
             f"SELECT tx_id, seq, entity, op, sample_no, item, site, value "
             f"FROM tx_ops WHERE tx_id IN ({ids}) ORDER BY tx_id, seq"
         ).fetchall()
+        undo_rows = conn.execute(
+            f"SELECT original_tx_id, compensation_tx_id FROM undo_record "
+            f"WHERE original_tx_id IN ({ids}) OR compensation_tx_id IN ({ids})"
+        ).fetchall()
+        change_cnt = {
+            r["tx_id"]: r["n"] for r in conn.execute(
+                f"SELECT tx_id, COUNT(*) AS n FROM undo_change "
+                f"WHERE tx_id IN ({ids}) GROUP BY tx_id"
+            )
+        }
     by_tx: dict[int, list[dict]] = {t["tx_id"]: [] for t in txs}
     for o in ops:
         by_tx[o["tx_id"]].append(dict(o))
+    comp_of: dict[int, int] = {}
+    is_comp: set[int] = set()
+    for r in undo_rows:
+        comp_of[r["original_tx_id"]] = r["compensation_tx_id"]
+        is_comp.add(r["compensation_tx_id"])
     for t in txs:
         t["ops"] = by_tx[t["tx_id"]]
+        t["is_compensation"] = t["tx_id"] in is_comp
+        t["undone_by_tx"] = comp_of.get(t["tx_id"])
+        # 有 undo_change 行的才是启用后的普通更正（具备撤销所需的前后值）。
+        t["undoable_recorded"] = change_cnt.get(t["tx_id"], 0) > 0
     return txs
 
 
