@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>地质化验数据同步 · 作业库 → 分析库</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --line:#334155; --fg:#e2e8f0; --mut:#94a3b8;
+          --ok:#22c55e; --warn:#eab308; --bad:#ef4444; --acc:#38bdf8; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 "Segoe UI",system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:14px 22px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--mut); font-size:12px; }
+  main { padding:18px 22px; display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .card h2 { margin:0 0 10px; font-size:14px; color:var(--acc); letter-spacing:.5px; }
+  .grid2 { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; font-size:13px; }
+  .grid2 .k { color:var(--mut); }
+  .badge { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; font-weight:600; }
+  .b-idle { background:#475569; color:#fff; }
+  .b-full { background:var(--warn); color:#111; }
+  .b-ready{ background:var(--ok); color:#052e12; }
+  .b-ok   { background:#14532d; color:#86efac; }
+  .b-bad  { background:#7f1d1d; color:#fecaca; }
+  button { background:var(--acc); color:#082f49; border:0; border-radius:8px; padding:8px 14px;
+           font-weight:600; cursor:pointer; margin:4px 6px 4px 0; }
+  button:disabled { background:#475569; color:#94a3b8; cursor:not-allowed; }
+  button.danger { background:#f97316; color:#431407; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--fg); }
+  input { background:#0b1220; border:1px solid var(--line); color:var(--fg); border-radius:8px; padding:8px 10px; width:220px; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th,td { border-bottom:1px solid var(--line); padding:5px 8px; text-align:left; }
+  th { color:var(--mut); font-weight:600; }
+  .mut { color:var(--mut); }
+  .err { color:var(--bad); font-size:12px; word-break:break-all; }
+  .ok  { color:var(--ok); }
+  .scroll { max-height:260px; overflow:auto; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  #toast { position:fixed; right:18px; bottom:18px; background:#0b1220; border:1px solid var(--line);
+           border-radius:10px; padding:10px 14px; max-width:420px; display:none; font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>地质化验数据同步平台</h1>
+  <span class="sub">作业库（source.db）→ 分析库（target.db） · 首次全量 + 有序增量 · 事务级一致</span>
+</header>
+<main>
+  <section class="card">
+    <h2>同步状态</h2>
+    <div class="grid2">
+      <span class="k">阶段</span><span><span id="phase" class="badge b-idle">…</span></span>
+      <span class="k">已应用进度 last_tx_id</span><span id="lastTx">-</span>
+      <span class="k">源端最新事务</span><span id="srcMax">-</span>
+      <span class="k">待同步事务</span><span id="pending">-</span>
+      <span class="k">快照水位 high_water</span><span id="highWater">-</span>
+      <span class="k">全量开始 / 完成</span><span id="fullTimes" class="mut">-</span>
+      <span class="k">两库对账</span><span id="consistent">-</span>
+      <span class="k">最近异常</span><span id="lastErr" class="err">无</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>操作台</h2>
+    <div class="row">
+      <button id="btnFull">① 发起首次全量同步</button>
+      <button id="btnCorrect" class="ghost">② 模拟一笔更正事务</button>
+    </div>
+    <div class="row">
+      <button id="btnAuto" class="ghost">自动更正：关</button>
+      <button id="btnFault" class="danger">注入下一次目标写入失败</button>
+    </div>
+    <p class="mut" style="margin:8px 0 0">
+      更正在源端一笔事务内完成（改样品 + 增删多条结果）；全量完成后才开放下方关联明细查询；
+      故障注入用于演示“写入失败不推进进度、重试不重复生效”。
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>数据规模</h2>
+    <div class="grid2">
+      <span class="k">作业库</span><span id="srcCounts">-</span>
+      <span class="k">分析库</span><span id="tgtCounts">-</span>
+    </div>
+  </section>
+
+  <section class="card" style="grid-column:1/-1">
+    <h2>关联明细查询（分析库）</h2>
+    <div class="row">
+      <input id="qNo" list="sampleList" placeholder="样品号，如 YT-0001">
+      <datalist id="sampleList"></datalist>
+      <button id="btnQuery">查询</button>
+      <span id="qMsg" class="mut"></span>
+    </div>
+    <div id="qResult"></div>
+  </section>
+
+  <section class="card">
+    <h2>作业库 · 最近事务日志</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>tx</th><th>时间</th><th>说明</th><th>操作流水</th></tr></thead>
+      <tbody id="txLog"></tbody>
+    </table></div>
+  </section>
+
+  <section class="card">
+    <h2>分析库 · 样品一览</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>样品号</th><th>采样点</th><th>结果数</th><th>来源 tx</th></tr></thead>
+      <tbody id="tgtSamples"></tbody>
+    </table></div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+function toast(msg, bad=false){
+  const t = $('toast'); t.textContent = msg;
+  t.style.borderColor = bad ? 'var(--bad)' : 'var(--ok)';
+  t.style.display = 'block';
+  clearTimeout(t._h); t._h = setTimeout(()=>t.style.display='none', 4000);
+}
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(()=>({}));
+  return {status:r.status, ...j};
+}
+async function refresh(){
+  const s = await api('/api/status');
+  const ph = $('phase');
+  ph.textContent = {idle:'待发起全量', full_running:'全量同步中', ready:'增量同步中'}[s.phase] || s.phase;
+  ph.className = 'badge ' + (s.phase==='ready'?'b-ready':s.phase==='full_running'?'b-full':'b-idle');
+  $('lastTx').textContent = s.last_tx_id;
+  $('srcMax').textContent = s.source_max_tx;
+  $('pending').textContent = s.pending;
+  $('highWater').textContent = s.high_water ?? '-';
+  $('fullTimes').textContent = (s.full_started_at||'-') + ' / ' + (s.full_done_at||'-');
+  $('consistent').innerHTML = s.consistent ? '<span class="badge b-ok">一致</span>'
+                                           : '<span class="badge b-bad">不一致</span>';
+  $('lastErr').textContent = s.last_error || '无';
+  $('srcCounts').textContent = `样品 ${s.source_counts.samples} · 结果 ${s.source_counts.results} · 事务 ${s.source_counts.txs}`;
+  $('tgtCounts').textContent = `样品 ${s.target_counts.samples} · 结果 ${s.target_counts.results}`;
+  $('btnFull').disabled = s.phase !== 'idle';
+  $('btnAuto').textContent = '自动更正：' + (s.auto_correct ? '开' : '关');
+  $('btnFault').textContent = s.fault_armed ? `故障已武装(${s.fault_armed})` : '注入下一次目标写入失败';
+
+  const txs = await api('/api/source/txs');
+  $('txLog').innerHTML = txs.txs.map(t=>{
+    const ops = t.ops.map(o=>{
+      const sym = {upsert:'＋', delete:'－'}[o.op] || o.op;
+      const what = o.entity==='sample' ? `样品${o.sample_no}→${o.site??''}`
+                  : `${o.sample_no}/${o.item}${o.op==='upsert'?'='+o.value:''}`;
+      return `${sym}${what}`;
+    }).join('；');
+    return `<tr><td>${t.tx_id}</td><td class="mut">${t.created_at}</td><td>${t.note}</td><td>${ops}</td></tr>`;
+  }).join('') || '<tr><td colspan="4" class="mut">暂无事务</td></tr>';
+
+  if (s.phase === 'ready'){
+    const ts = await api('/api/target/samples');
+    $('tgtSamples').innerHTML = ts.samples.map(x=>
+      `<tr><td>${x.sample_no}</td><td>${x.site}</td><td>${x.n_results}</td><td>${x.applied_tx}</td></tr>`
+    ).join('');
+    $('sampleList').innerHTML = ts.samples.map(x=>`<option value="${x.sample_no}">`).join('');
+  }
+}
+$('btnFull').onclick = async ()=>{
+  const r = await api('/api/sync/full', {method:'POST'});
+  toast(r.message, !r.ok); refresh();
+};
+$('btnCorrect').onclick = async ()=>{
+  const r = await api('/api/source/correct', {method:'POST'});
+  if (r.ok) toast(`源端更正已提交 tx=${r.tx_id}（样品 ${r.sample_no}）`); else toast(r.message, true);
+  refresh();
+};
+$('btnAuto').onclick = async ()=>{
+  const cur = $('btnAuto').textContent.includes('开');
+  await api('/api/source/auto', {method:'POST', headers:{'Content-Type':'application/json'},
+                                 body:JSON.stringify({enabled:!cur})});
+  refresh();
+};
+$('btnFault').onclick = async ()=>{
+  const r = await api('/api/fault/inject', {method:'POST'});
+  toast(r.message); refresh();
+};
+$('btnQuery').onclick = async ()=>{
+  const no = $('qNo').value.trim();
+  const r = await api('/api/query?sample_no=' + encodeURIComponent(no));
+  if (!r.ok){ $('qMsg').textContent = r.message; $('qMsg').className='err'; $('qResult').innerHTML=''; return; }
+  $('qMsg').textContent = '';
+  const s = r.sample;
+  $('qResult').innerHTML =
+    `<p>样品 <b>${s.sample_no}</b> · 采样点 <b>${s.site}</b> · 数据来自源端事务 tx=${s.applied_tx}</p>
+     <table><thead><tr><th>项目</th><th>检测值</th><th>来源 tx</th></tr></thead>
+     <tbody>${s.results.map(x=>`<tr><td>${x.item}</td><td>${x.value}</td><td>${x.applied_tx}</td></tr>`).join('')
+            || '<tr><td colspan="3" class="mut">该样品暂无化验结果</td></tr>'}</tbody></table>`;
+};
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

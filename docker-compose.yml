@@ -1,0 +1,26 @@
+services:
+  geosync:
+    build: .
+    image: geosync:latest
+    container_name: geosync
+    ports:
+      - "5000:5000"
+    volumes:
+      # 两库独立存放：作业库与分析库分别位于两个独立卷，互不耦合；
+      # 挂卷后容器重建/重启不丢数据与同步进度。验证断点续传可执行：
+      #   docker compose restart   或   docker compose kill && docker compose up -d
+      - source-data:/data/source
+      - target-data:/data/target
+    environment:
+      SOURCE_DB: /data/source/source.db
+      TARGET_DB: /data/target/target.db
+      SYNC_POLL_INTERVAL: "0.5"
+      AUTO_CORRECT_INTERVAL: "2.5"
+      SEED_SAMPLES: "20"
+      # SYNC_SNAPSHOT_DELAY_MS 为测试钩子，生产保持 0
+      SYNC_SNAPSHOT_DELAY_MS: "0"
+    restart: unless-stopped
+
+volumes:
+  source-data:
+  target-data:
